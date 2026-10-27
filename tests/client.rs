@@ -656,3 +656,78 @@ async fn http1_max_headers() {
     assert_eq!(res.headers()["x-custom-0"], "value");
     assert_eq!(res.headers()["x-custom-149"], "value");
 }
+
+#[tokio::test]
+async fn tcp_socket_initializer_new_connections() {
+    use std::sync::{Arc, Mutex};
+
+    let server = server::http(|_| async {
+        http::Response::builder()
+            .header("connection", "close")
+            .body(reqwest::Body::from("initialized"))
+            .unwrap()
+    });
+    let peers = Arc::new(Mutex::new(Vec::new()));
+    let captured = peers.clone();
+    let client = Client::builder()
+        .no_proxy()
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
+        .resolve("initializer.test", server.addr())
+        .tcp_socket_initializer(Arc::new(move |socket, peer| {
+            assert!(socket.peer_addr().is_err());
+            if let Ok(local) = socket.local_addr() {
+                assert_eq!(local.port(), 0);
+                assert!(local.ip().is_unspecified());
+            }
+            captured.lock().unwrap().push(peer);
+            Ok(())
+        }))
+        .build()
+        .unwrap();
+    for _ in 0..2 {
+        let response = client.get("http://initializer.test/").send().await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "initialized");
+    }
+    assert_eq!(*peers.lock().unwrap(), vec![server.addr(); 2]);
+}
+
+#[tokio::test]
+async fn tcp_socket_initializer_denies_direct_and_proxy() {
+    use std::io::{self, ErrorKind};
+    use std::sync::{Arc, Mutex};
+
+    for proxy in [false, true] {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let peer = listener.local_addr().unwrap();
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let captured = peers.clone();
+        let mut builder = Client::builder().no_proxy();
+        let url = if proxy {
+            builder = builder.proxy(reqwest::Proxy::all(format!("http://{peer}")).unwrap());
+            "http://origin.invalid/".to_owned()
+        } else {
+            format!("http://{peer}/")
+        };
+        let client = builder
+            .tcp_socket_initializer(Arc::new(move |socket, addr| {
+                assert!(socket.peer_addr().is_err());
+                captured.lock().unwrap().push(addr);
+                Err(io::Error::new(ErrorKind::PermissionDenied, "socket denied"))
+            }))
+            .build()
+            .unwrap();
+        let error = client.get(url).send().await.unwrap_err();
+        assert!(error.is_connect());
+        let mut source: &dyn std::error::Error = &error;
+        while let Some(next) = source.source() {
+            source = next;
+        }
+        assert_eq!(
+            source.downcast_ref::<io::Error>().unwrap().kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(*peers.lock().unwrap(), vec![peer]);
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    }
+}

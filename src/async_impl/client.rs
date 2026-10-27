@@ -230,6 +230,7 @@ struct Config {
     #[cfg(feature = "http2")]
     http2_keep_alive_while_idle: bool,
     local_address: Option<IpAddr>,
+    tcp_socket_initializer: Option<hyper_util::client::legacy::connect::TcpSocketInitializer>,
     #[cfg(any(
         target_os = "android",
         target_os = "fuchsia",
@@ -362,6 +363,7 @@ impl ClientBuilder {
                 #[cfg(feature = "http2")]
                 http2_keep_alive_while_idle: false,
                 local_address: None,
+                tcp_socket_initializer: None,
                 #[cfg(any(
                     target_os = "android",
                     target_os = "fuchsia",
@@ -459,6 +461,9 @@ impl ClientBuilder {
 
             let mut http = HttpConnector::new_with_resolver(resolver.clone());
             http.set_connect_timeout(config.connect_timeout);
+            if let Some(initializer) = config.tcp_socket_initializer {
+                http.set_socket_initializer(initializer);
+            }
 
             #[cfg(all(feature = "http3", feature = "__rustls"))]
             let build_h3_connector =
@@ -1722,6 +1727,29 @@ impl ClientBuilder {
     }
 
     // TCP options
+
+    /// Sets a callback to initialize each newly created native TCP socket.
+    ///
+    /// The callback receives the resolved peer address and runs synchronously
+    /// before local-address binding and connect. It may capture shared state
+    /// and should return promptly. It must not bind or connect the socket, or
+    /// change its nonblocking mode.
+    ///
+    /// Returning an error prevents that socket from connecting. Other resolved
+    /// addresses may still be attempted, each invoking the callback. Reject
+    /// every candidate to deny the entire connection attempt.
+    ///
+    /// With a proxy, the peer is the proxy endpoint. Reused connections do not
+    /// invoke the callback again; every new TCP connection does, including those
+    /// needed for redirects or retries. This does not apply to QUIC, Unix domain
+    /// sockets or Windows named pipes.
+    pub fn tcp_socket_initializer(
+        mut self,
+        initializer: hyper_util::client::legacy::connect::TcpSocketInitializer,
+    ) -> ClientBuilder {
+        self.config.tcp_socket_initializer = Some(initializer);
+        self
+    }
 
     /// Set whether sockets have `TCP_NODELAY` enabled.
     ///
